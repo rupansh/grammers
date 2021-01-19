@@ -354,7 +354,8 @@ impl ClientHandle {
         &mut self,
         chat: &Chat,
         message: types::InputMessage,
-    ) -> Result<(), InvocationError> {
+    ) -> Result<i64, InvocationError> {
+        let id = generate_random_id();
         if let Some(media) = message.media {
             self.invoke(&tl::functions::messages::SendMedia {
                 silent: message.silent,
@@ -364,7 +365,7 @@ impl ClientHandle {
                 reply_to_msg_id: message.reply_to,
                 media,
                 message: message.text,
-                random_id: generate_random_id(),
+                random_id: id,
                 reply_markup: message.reply_markup,
                 entities: if message.entities.is_empty() {
                     None
@@ -374,7 +375,6 @@ impl ClientHandle {
                 schedule_date: message.schedule_date,
             })
             .await
-            .map(drop)
         } else {
             self.invoke(&tl::functions::messages::SendMessage {
                 no_webpage: !message.link_preview,
@@ -384,7 +384,7 @@ impl ClientHandle {
                 peer: chat.to_input_peer(),
                 reply_to_msg_id: message.reply_to,
                 message: message.text,
-                random_id: generate_random_id(),
+                random_id: id,
                 reply_markup: message.reply_markup,
                 entities: if message.entities.is_empty() {
                     None
@@ -394,8 +394,9 @@ impl ClientHandle {
                 schedule_date: message.schedule_date,
             })
             .await
-            .map(drop)
-        }
+        }?;
+
+        return Ok(id);
     }
 
     /// Edits an existing message.
