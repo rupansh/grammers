@@ -11,7 +11,7 @@
 use super::ClientHandle;
 use crate::types::{
     AdminRightsBuilder, BannedRightsBuilder, Chat, ChatMap, IterBuffer, Message, Participant,
-    Photo, User,
+    Photo, User, chats::invoke_wrap, chats::AdminBuilderImpl
 };
 pub use grammers_mtsender::{AuthorizationError, InvocationError};
 use grammers_tl_types as tl;
@@ -523,8 +523,8 @@ impl ClientHandle {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn set_admin_rights(&mut self, channel: &Chat, user: &User) -> AdminRightsBuilder {
-        AdminRightsBuilder::new(self.clone(), channel, user)
+    pub fn set_admin_rights(&mut self, channel: &Chat, user: &User) -> impl AdminBuilderImpl + std::future::Future<Output = Result<(), InvocationError>> + Send + 'static  {
+        AdminRightsBuilder::new(self.clone(), channel, user, invoke_wrap)
     }
 
     /// Iterate over the history of profile photos for the given user or chat.

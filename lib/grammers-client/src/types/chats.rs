@@ -9,16 +9,41 @@ use crate::types::{Chat, Role, User};
 use crate::ClientHandle;
 use grammers_mtproto::mtp::RpcError;
 use grammers_mtsender::InvocationError;
+use tokio::pin;
 use grammers_tl_types as tl;
+use pin_project::pin_project;
 use std::{
+    future::Future,
+    task::{Context, Poll},
+    pin::Pin,
     mem::drop,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-/// Builder for editing the administrator rights of a user in a specific chat.
-///
-/// Use [`ClientHandle::set_admin_rights`] to retrieve an instance of this type.
-pub struct AdminRightsBuilder {
+#[pin_project]
+struct FutWrap<T, F: Future<Output = Result<T, InvocationError>> + Send + 'static > {
+    #[pin]
+    fut: F
+}
+
+impl<T, F: Future<Output = Result<T, InvocationError>> + Send + 'static > FutWrap<T, F> {
+    fn new(f: F) -> Self {
+        FutWrap { fut: f }
+    }
+}
+
+impl<T, F> Future for FutWrap<T, F>
+    where F: Future<Output = Result<T, InvocationError>> + Send + 'static 
+{
+    type Output = Result<T, InvocationError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().fut.poll(cx)
+    }
+}
+
+#[derive(Clone)]
+pub struct AdminRightsBuilderInner {
     client: ClientHandle,
     chat: Chat,
     user: tl::enums::InputUser,
@@ -26,10 +51,274 @@ pub struct AdminRightsBuilder {
     rank: String,
 }
 
-impl AdminRightsBuilder {
-    pub(crate) fn new(client: ClientHandle, chat: &Chat, user: &User) -> Self {
-        Self {
-            client,
+/// Builder for editing the administrator rights of a user in a specific chat.
+///
+/// Use [`ClientHandle::set_admin_rights`] to retrieve an instance of this type.
+#[pin_project]
+pub struct AdminRightsBuilder<F, Fnc> 
+where
+    F: Future<Output = Result<(), InvocationError>> + Send + 'static ,
+    Fnc: Fn(AdminRightsBuilderInner) -> F 
+{
+    inner: AdminRightsBuilderInner,
+    f: Fnc,
+    #[pin]
+    fut: Option<FutWrap<(), F>>
+}
+
+impl<F, Fnc> Future for AdminRightsBuilder<F, Fnc>
+    where F: Future<Output = Result<(), InvocationError>> + Send + 'static ,
+          Fnc: Fn(AdminRightsBuilderInner) -> F 
+{
+    type Output = Result<(), InvocationError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut proj = self.project();
+        if proj.fut.is_none() {
+            let func = proj.f;
+            let inner = proj.inner.clone();
+            let ok = Some(FutWrap::<(), F>::new(func(inner)));
+            pin!(ok);
+            proj.fut = ok;
+            Future::poll(proj.fut.as_pin_mut().unwrap(), cx)
+        } else {
+            Future::poll(proj.fut.as_pin_mut().unwrap(), cx)
+        }
+    }
+}
+
+
+pub async fn invoke_wrap(s: AdminRightsBuilderInner) -> Result<(), InvocationError> {
+    let mut s = s;
+    if let Some(chan) = s.chat.to_input_channel() {
+        s.client
+            .invoke(&tl::functions::channels::EditAdmin {
+                channel: chan,
+                user_id: s.user.clone(),
+                admin_rights: tl::enums::ChatAdminRights::Rights(s.rights.clone()),
+                rank: s.rank.clone(),
+            })
+            .await
+            .map(drop)
+    } else if let Some(id) = s.chat.to_chat_id() {
+        let promote = if s.rights.anonymous
+            || s.rights.change_info
+            || s.rights.post_messages
+            || s.rights.edit_messages
+            || s.rights.delete_messages
+            || s.rights.ban_users
+            || s.rights.invite_users
+            || s.rights.pin_messages
+            || s.rights.add_admins
+            || s.rights.manage_call
+        {
+            true
+        } else {
+            false
+        };
+        s.client
+            .invoke(&tl::functions::messages::EditChatAdmin {
+                chat_id: id,
+                user_id: s.user.clone(),
+                is_admin: promote,
+            })
+            .await
+            .map(drop)
+    } else {
+        Err(InvocationError::Rpc(RpcError {
+            code: 400,
+            name: "PEER_ID_INVALID".to_string(),
+            value: None,
+        }))
+    }
+}
+
+/*pub(crate) async fn invoke_wrap<F, Fnc>(s: &mut AdminRightsBuilder<F, Fnc>) -> Result<(), InvocationError>
+    where F: Future<Output = Result<(), InvocationError>> + Send + 'static,
+          Fnc: Fn(&mut AdminRightsBuilder<F, Fnc>) -> F
+{
+    return s.invoke().await
+}*/
+
+pub trait AdminBuilderImpl<'a>: 'a {
+    //type Output;
+
+
+//    fn load_current(&'a mut self) -> Self::Output;
+
+    fn anonymous(self, val: bool) -> Self;
+    fn manage_call(self, val: bool) -> Self;
+    fn change_info(self, val: bool) -> Self;
+    fn post_messages(self, val: bool) -> Self;
+    fn edit_messages(self, val: bool) -> Self;
+    fn delete_messages(self, val: bool) -> Self;
+    fn ban_users(self, val: bool) -> Self;
+    fn invite_users(self, val: bool) -> Self;
+    fn pin_messages(self, val: bool) -> Self;
+    fn add_admins(self, val: bool) -> Self;
+    fn rank<S: Into<String>>(self, val: S) -> Self;
+}
+
+impl<'a, F, Fnc> AdminBuilderImpl<'a> for AdminRightsBuilder<F, Fnc>
+where
+    F: Future<Output = Result<(), InvocationError>> + Send + 'static ,
+    Fnc: (Fn(AdminRightsBuilderInner) -> F) + 'a ,
+{
+//    type Output = FutWrap<Result<&'a mut Self, InvocationError>, impl Future<Output = Result<&'a mut Self, InvocationError>>>;
+
+    /*fn load_current(&mut self) -> Self::Output {
+        let c = async { if let Some(chan) = self.inner.chat.to_input_channel() {
+            let tl::enums::channels::ChannelParticipant::Participant(user) = self
+                .inner.client
+                .invoke(&tl::functions::channels::GetParticipant {
+                    channel: chan,
+                    user_id: self.inner.user.clone(),
+                })
+                .await?;
+            match user.participant {
+                tl::enums::ChannelParticipant::Creator(c) => {
+                    self.inner.rights = c.admin_rights.into();
+                    self.inner.rank = c.rank.unwrap_or_else(String::new);
+                }
+                tl::enums::ChannelParticipant::Admin(a) => {
+                    self.inner.rights = a.admin_rights.into();
+                    self.inner.rank = a.rank.unwrap_or_else(String::new);
+                }
+                _ => (),
+            }
+        } else if matches! {self.inner.chat, Chat::Group(_)} {
+            let uid = match &self.inner.user {
+                tl::enums::InputUser::User(u) => u.user_id,
+                tl::enums::InputUser::FromMessage(u) => u.user_id,
+                _ => {
+                    return Err(InvocationError::Rpc(RpcError {
+                        code: 400,
+                        name: "PEER_ID_INVALID".to_string(),
+                        value: None,
+                    }))
+                }
+            };
+
+            let mut participants = self.inner.client.iter_participants(&self.inner.chat);
+            while let Some(participant) = participants.next().await? {
+                if matches!(participant.role, Role::Creator(_) | Role::Admin(_))
+                    && participant.user.id() == uid
+                {
+                    self.inner.rights = tl::types::ChatAdminRights {
+                        change_info: true,
+                        post_messages: true,
+                        edit_messages: false,
+                        delete_messages: true,
+                        ban_users: true,
+                        invite_users: true,
+                        pin_messages: true,
+                        add_admins: true,
+                        anonymous: false,
+                        manage_call: true,
+                    };
+                    break;
+                }
+            }
+        }
+
+        Ok(self) 
+        };
+        return c;
+    }*/
+
+    /// Whether the user will remain anonymous when sending messages.
+    ///
+    /// The sender of the anonymous messages becomes the group itself.
+    ///
+    /// Note that other people in the channel may be able to identify the anonymous admin by its
+    /// custom rank, so additional care is needed when using both anonymous and custom ranks.
+    ///
+    /// For example, if multiple anonymous admins share the same title, users won't be able to
+    /// distinguish them.
+    fn anonymous(mut self, val: bool) -> Self {
+        self.inner.rights.anonymous = val;
+        self
+    }
+
+    /// Whether the user is able to manage calls in the group.
+    fn manage_call(mut self, val: bool) -> Self {
+        self.inner.rights.manage_call = val;
+        self
+    }
+
+    /// Whether the user is able to change information about the chat such as group description or
+    /// not.
+    fn change_info(mut self, val: bool) -> Self {
+        self.inner.rights.change_info = val;
+        self
+    }
+
+    /// Whether the user will be able to post in the channel. This will only work in broadcast
+    /// channels, not groups.
+    fn post_messages(mut self, val: bool) -> Self {
+        self.inner.rights.post_messages = val;
+        self
+    }
+
+    /// Whether the user will be able to edit messages in the channel. This will only work in
+    /// broadcast channels, not groups.
+    fn edit_messages(mut self, val: bool) -> Self {
+        self.inner.rights.edit_messages = val;
+        self
+    }
+
+    /// Whether the user will be able to delete messages. This includes messages from others.
+    fn delete_messages(mut self, val: bool) -> Self {
+        self.inner.rights.delete_messages = val;
+        self
+    }
+
+    /// Whether the user will be able to edit the restrictions of other users. This effectively
+    /// lets the administrator ban (or kick) people.
+    fn ban_users(mut self, val: bool) -> Self {
+        self.inner.rights.ban_users = val;
+        self
+    }
+
+    /// Whether the user will be able to invite other users.
+    fn invite_users(mut self, val: bool) -> Self {
+        self.inner.rights.invite_users = val;
+        self
+    }
+
+    /// Whether the user will be able to pin messages.
+    fn pin_messages(mut self, val: bool) -> Self {
+        self.inner.rights.pin_messages = val;
+        self
+    }
+
+    /// Whether the user will be able to add other administrators with the same or less
+    /// permissions than the user itself.
+    fn add_admins(mut self, val: bool) -> Self {
+        self.inner.rights.add_admins = val;
+        self
+    }
+
+    /// The custom rank  (also known as "admin title" or "badge") to show for this administrator.
+    ///
+    /// This text will be shown instead of the "admin" badge.
+    ///
+    /// When left unspecified or empty, the default localized "admin" badge will be shown.
+    fn rank<S: Into<String>>(mut self, val: S) -> Self {
+        self.inner.rank = val.into();
+        self
+    }
+
+}
+
+impl<F, Fnc> AdminRightsBuilder<F, Fnc> 
+where
+    F: Future<Output = Result<(), InvocationError>> + Send + 'static ,
+    Fnc: Fn(AdminRightsBuilderInner) -> F 
+{
+    pub(crate) fn new(client: ClientHandle, chat: &Chat, user: &User, func: Fnc) -> Self {
+        AdminRightsBuilder {
+            inner: AdminRightsBuilderInner { client,
             chat: chat.clone(),
             user: user.to_input(),
             rank: "".into(),
@@ -44,34 +333,36 @@ impl AdminRightsBuilder {
                 pin_messages: false,
                 add_admins: false,
                 manage_call: false,
-            },
+            }},
+            f: func,
+            fut: None
         }
     }
 
     /// Load the current rights of the user. This lets you trivially grant or take away specific
     /// permissions without changing any of the previous ones.
     pub async fn load_current(&mut self) -> Result<&mut Self, InvocationError> {
-        if let Some(chan) = self.chat.to_input_channel() {
+        if let Some(chan) = self.inner.chat.to_input_channel() {
             let tl::enums::channels::ChannelParticipant::Participant(user) = self
-                .client
+                .inner.client
                 .invoke(&tl::functions::channels::GetParticipant {
                     channel: chan,
-                    user_id: self.user.clone(),
+                    user_id: self.inner.user.clone(),
                 })
                 .await?;
             match user.participant {
                 tl::enums::ChannelParticipant::Creator(c) => {
-                    self.rights = c.admin_rights.into();
-                    self.rank = c.rank.unwrap_or_else(String::new);
+                    self.inner.rights = c.admin_rights.into();
+                    self.inner.rank = c.rank.unwrap_or_else(String::new);
                 }
                 tl::enums::ChannelParticipant::Admin(a) => {
-                    self.rights = a.admin_rights.into();
-                    self.rank = a.rank.unwrap_or_else(String::new);
+                    self.inner.rights = a.admin_rights.into();
+                    self.inner.rank = a.rank.unwrap_or_else(String::new);
                 }
                 _ => (),
             }
-        } else if matches! {self.chat, Chat::Group(_)} {
-            let uid = match &self.user {
+        } else if matches! {self.inner.chat, Chat::Group(_)} {
+            let uid = match &self.inner.user {
                 tl::enums::InputUser::User(u) => u.user_id,
                 tl::enums::InputUser::FromMessage(u) => u.user_id,
                 _ => {
@@ -83,12 +374,12 @@ impl AdminRightsBuilder {
                 }
             };
 
-            let mut participants = self.client.iter_participants(&self.chat);
+            let mut participants = self.inner.client.iter_participants(&self.inner.chat);
             while let Some(participant) = participants.next().await? {
                 if matches!(participant.role, Role::Creator(_) | Role::Admin(_))
                     && participant.user.id() == uid
                 {
-                    self.rights = tl::types::ChatAdminRights {
+                    self.inner.rights = tl::types::ChatAdminRights {
                         change_info: true,
                         post_messages: true,
                         edit_messages: false,
@@ -106,134 +397,6 @@ impl AdminRightsBuilder {
         }
 
         Ok(self)
-    }
-
-    /// Whether the user will remain anonymous when sending messages.
-    ///
-    /// The sender of the anonymous messages becomes the group itself.
-    ///
-    /// Note that other people in the channel may be able to identify the anonymous admin by its
-    /// custom rank, so additional care is needed when using both anonymous and custom ranks.
-    ///
-    /// For example, if multiple anonymous admins share the same title, users won't be able to
-    /// distinguish them.
-    pub fn anonymous(&mut self, val: bool) -> &mut Self {
-        self.rights.anonymous = val;
-        self
-    }
-
-    /// Whether the user is able to manage calls in the group.
-    pub fn manage_call(&mut self, val: bool) -> &mut Self {
-        self.rights.manage_call = val;
-        self
-    }
-
-    /// Whether the user is able to change information about the chat such as group description or
-    /// not.
-    pub fn change_info(&mut self, val: bool) -> &mut Self {
-        self.rights.change_info = val;
-        self
-    }
-
-    /// Whether the user will be able to post in the channel. This will only work in broadcast
-    /// channels, not groups.
-    pub fn post_messages(&mut self, val: bool) -> &mut Self {
-        self.rights.post_messages = val;
-        self
-    }
-
-    /// Whether the user will be able to edit messages in the channel. This will only work in
-    /// broadcast channels, not groups.
-    pub fn edit_messages(&mut self, val: bool) -> &mut Self {
-        self.rights.edit_messages = val;
-        self
-    }
-
-    /// Whether the user will be able to delete messages. This includes messages from others.
-    pub fn delete_messages(&mut self, val: bool) -> &mut Self {
-        self.rights.delete_messages = val;
-        self
-    }
-
-    /// Whether the user will be able to edit the restrictions of other users. This effectively
-    /// lets the administrator ban (or kick) people.
-    pub fn ban_users(&mut self, val: bool) -> &mut Self {
-        self.rights.ban_users = val;
-        self
-    }
-
-    /// Whether the user will be able to invite other users.
-    pub fn invite_users(&mut self, val: bool) -> &mut Self {
-        self.rights.invite_users = val;
-        self
-    }
-
-    /// Whether the user will be able to pin messages.
-    pub fn pin_messages(&mut self, val: bool) -> &mut Self {
-        self.rights.pin_messages = val;
-        self
-    }
-
-    /// Whether the user will be able to add other administrators with the same or less
-    /// permissions than the user itself.
-    pub fn add_admins(&mut self, val: bool) -> &mut Self {
-        self.rights.add_admins = val;
-        self
-    }
-
-    /// The custom rank  (also known as "admin title" or "badge") to show for this administrator.
-    ///
-    /// This text will be shown instead of the "admin" badge.
-    ///
-    /// When left unspecified or empty, the default localized "admin" badge will be shown.
-    pub fn rank<S: Into<String>>(&mut self, val: S) -> &mut Self {
-        self.rank = val.into();
-        self
-    }
-
-    /// Perform the call.
-    pub async fn invoke(&mut self) -> Result<(), InvocationError> {
-        if let Some(chan) = self.chat.to_input_channel() {
-            self.client
-                .invoke(&tl::functions::channels::EditAdmin {
-                    channel: chan,
-                    user_id: self.user.clone(),
-                    admin_rights: tl::enums::ChatAdminRights::Rights(self.rights.clone()),
-                    rank: self.rank.clone(),
-                })
-                .await
-                .map(drop)
-        } else if let Some(id) = self.chat.to_chat_id() {
-            let promote = if self.rights.anonymous
-                || self.rights.change_info
-                || self.rights.post_messages
-                || self.rights.edit_messages
-                || self.rights.delete_messages
-                || self.rights.ban_users
-                || self.rights.invite_users
-                || self.rights.pin_messages
-                || self.rights.add_admins
-                || self.rights.manage_call
-            {
-                true
-            } else {
-                false
-            };
-            self.client
-                .invoke(&tl::functions::messages::EditChatAdmin {
-                    chat_id: id,
-                    user_id: self.user.clone(),
-                    is_admin: promote,
-                })
-                .await
-                .map(drop)
-        } else {
-            Err(InvocationError::Rpc(RpcError {
-                code: 400,
-                name: "PEER_ID_INVALID".to_string(),
-                value: None,
-            }))
-        }
     }
 }
 
